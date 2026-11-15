@@ -1,207 +1,129 @@
 # NFS Underground 2 — Network Remote Code Execution
 
-Two heap buffer overflow vulnerabilities in the Need for Speed Underground 2 multiplayer networking code that achieve **remote code execution** from attacker-controlled network packets.
-
-| | |
-|---|---|
-| **Product** | Need for Speed Underground 2 (SPEED2.EXE) |
-| **Version** | PC (Windows) |
-| **Vendor** | Electronic Arts |
-| **Platform** | Windows x86 (32-bit PE) |
-| **Severity** | Critical (CVSS 3.1: 9.8 — AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H) |
-| **Attack vector** | Network (TCP key exchange, UDP game session) |
-| **Impact** | Remote code execution — no user interaction beyond joining a game |
-| **Date** | November 2026 |
-
-## Attack Scenario
-
-The victim launches the game and joins a multiplayer session — LAN or online. A malicious server (RCE-1) or any peer in the same lobby (RCE-2) sends a single crafted packet. The victim's game overflows a heap buffer with attacker-controlled data, corrupts an adjacent network object's function pointer table, and executes arbitrary code on the next frame tick. No file transfer, no save loading, no user interaction beyond connecting.
-
-## Why This Works
-
-The binary has **zero modern exploit mitigations**:
-
-| Mitigation | Status |
-|------------|--------|
-| ASLR | **None** — fixed image base `0x00400000` |
-| Stack cookies (/GS) | Present but **irrelevant** — overflow targets heap, not stack |
-| DEP | **None** — `/NXCOMPAT` not set, heap is executable |
-| Packet validation | **None** — attacker-controlled length goes directly to `recv()` |
+Two remote code execution vulnerabilities discovered in Need for Speed: Underground 2 (SPEED2.EXE). This repository contains a working proof-of-concept for one of them.
 
 ## Vulnerabilities
 
-| ID | Vector | Location | Trigger | CVSS 3.1 |
-|----|--------|----------|---------|----------|
-| **RCE-1** | TCP key exchange | `FUN_00759910` | Malicious server or MITM sends crafted handshake response | **9.8 Critical** |
-| **RCE-2** | UDP game session | `FUN_007510c0` | Any peer in the same lobby sends one oversized packet | 8.1 High |
+| # | Vector | Description | Status |
+|---|--------|-------------|--------|
+| 1 | TCP certificate handler (state 0xb) | Unbounded memcpy → pool free-list corruption → DWORD shoot | **Working PoC** |
+| 2 | UDP game session | Heap overflow via oversized packet | **Identified** |
 
-Both overflow heap-allocated buffers with attacker-controlled data, corrupt adjacent C++ network objects' function pointer tables (14 entries), and achieve arbitrary code execution through the game's own vtable dispatch mechanism.
+## Target
 
-## The Exploit Chain
+| | |
+|---|---|
+| **Binary** | SPEED2.EXE (32-bit x86 PE) |
+| **SHA-256** | `8f6a9ae2c4cfa01181d2fd755d99c6f4b7103f60273908ea1de1e719dfe2a297` |
+| **ASLR** | None — fixed base `0x00400000` |
+| **DEP** | None — `/NXCOMPAT` not set |
+| **SafeSEH** | None |
+| **Online servers** | Shut down by EA in 2007 |
 
-```
-Attacker sends crafted packet
-    │
-    ├── RCE-1: TCP key exchange, header bytes 0xFF 0xFF
-    │         → FUN_00759910 parses length as 32,769 bytes
-    │         → recv(32769) into 16,388-byte session buffer
-    │
-    └── RCE-2: UDP game session, length field 0x7FFF
-              → FUN_007510c0 parses length as 32,769 bytes
-              → recv(32769) into ~1,024-byte circular buffer slot
-    │
-    ▼
-Heap overflow (16,381 or 30,000+ bytes past buffer)
-    │
-    ▼
-Adjacent network object vtable overwritten
-(14 function pointers: constructor, destructor, process_packet,
- send, close, listen, accept, configure, stats, read_buffer, ...)
-    │
-    ▼
-Game dispatches through corrupted pointer on next tick
-    │
-    ▼
-Arbitrary code execution
-```
+## Vulnerability #1 — Unbounded Copy → DWORD Shoot → Code Execution
 
-## The Recv Wrapper Has No Bounds Checking
+### Overview
 
-All network receive calls flow through `FUN_0074a6d0` at `0x74a6d0`:
+When the game connects to the authentication server (port 20971), it performs a TLS-like handshake. The certificate handler copies attacker-controlled data into a heap buffer with **no bounds check**. This overflows into the adjacent pool allocator free-list node, giving the attacker control over the allocator's linked-list pointers.
 
-```c
-// Thin wrapper — passes caller's size directly to Winsock
-if (param_5 == NULL)
-    recv(*(param_1 + 0x18), param_2, param_3, 0);     // param_3 = attacker-controlled
-else
-    recvfrom(*(param_1 + 0x18), param_2, param_3, 0, param_5, param_6);
-```
+When the connection closes and the buffer is freed, the pool allocator's coalesce logic performs a controlled 4-byte write (DWORD shoot) to a function pointer in the `.data` section. The next pool allocation jumps through the overwritten pointer into attacker-supplied shellcode.
 
-No clamping, no bounds check. Whatever length the caller computes from the wire goes straight to `recv()`.
+**A single TCP packet achieves arbitrary code execution. The game's own code handles every step.**
 
-## Trigger Path — How It Fires Automatically
-
-The overflow triggers through the game's normal network update loop, called every frame:
+### Exploit Chain
 
 ```
-Game main loop (FUN_004e6c30 / FUN_004e77a0 / FUN_004f2840)
-    → FUN_00584f20 (network subsystem tick)
-        → FUN_00740600 (network update)
-            → FUN_0074e8e0 (packet processor)
-                → FUN_00754490 (TCP state machine)
-                    → FUN_00759910 — RCE-1 OVERFLOW
-                → vtable dispatch: CALL [peer + 0x30]
-                    → FUN_00751660 (read_buffer)
-                        → FUN_007510c0 — RCE-2 OVERFLOW
+1. Game connects to auth server on port 20971
+2. Server replies with a crafted X.509 certificate
+3. CA validation passes — issuer DN matches EA's hardcoded root CA
+4. Signature verification bypassed — rsaEncryption OID causes
+   CMPSB to compare zero bytes (always succeeds)
+5. Unbounded memcpy copies attacker data past the buffer boundary
+6. Overflow corrupts the adjacent pool free-list node:
+     next → function_pointer - 4
+     prev → address of shellcode (past fill zone)
+7. A fake node with embedded shellcode is written 32 bytes past
+   the free node, outside the debug fill range
+8. TCP close triggers buffer free → pool allocator:
+     a) Sorted insert into free list
+     b) Forward coalesce — merges with corrupted node
+     c) Backward coalesce — overwrites function pointer (DWORD shoot)
+     d) Debug fill (0xEE) — shellcode survives at node+32
+9. Next allocation → JMP through overwritten pointer → shellcode
 ```
 
-No menu navigation, no button press — the game's own frame loop processes incoming packets and fires the overflow.
+### Pool Allocator
 
-## Heap Vtable Corruption
-
-The network object factory `FUN_00751940` allocates 0x214 bytes and installs 14 function pointers:
-
-| Offset | Entry | Original Target |
-|--------|-------|-----------------|
-| +0x00 | constructor | `FUN_00751940` |
-| +0x04 | destructor | `FUN_00751490` |
-| +0x08 | connect | `LAB_00752200` |
-| +0x0C | **process_packet** | `FUN_00757900` |
-| +0x10 | send | `FUN_00751750` |
-| +0x14 | close | `FUN_00751520` |
-| +0x18 | listen | `LAB_00751880` |
-| +0x1C | close_alias | `FUN_00751520` |
-| +0x20 | accept | `LAB_00751500` |
-| +0x24 | configure | `LAB_00753ab0` |
-| +0x28 | timestamp | `GetTickCount` |
-| +0x2C | stats | `FUN_00751560` |
-| +0x30 | **read_buffer** | `FUN_00751660` |
-| +0x34 | write_buffer | `LAB_00751700` |
-
-When the overflow corrupts these pointers, the game's own dispatch code (`CALL [object + offset]`) redirects execution to the attacker's chosen address.
-
-## Proof of Concept — Six Proofs, Three Scripts
-
-Each script proves both vectors at a different level of the exploit chain:
-
-| # | Script | Vector | What It Proves |
-|---|--------|--------|----------------|
-| 1 | `network_rce_proof.js` | RCE-1 (TCP) | 16,381-byte heap overflow past buffer boundary |
-| 2 | `network_rce_proof.js` | RCE-2 (UDP) | 30,000+ byte overflow past circular buffer slot |
-| 3 | `network_eip_control.js` | RCE-1 (TCP) | 14/14 vtable pointers corrupted to `0x41414141` |
-| 4 | `network_eip_control.js` | RCE-2 (UDP) | 14/14 vtable pointers corrupted to `0x41414141` |
-| 5 | `network_rce_ace.js` | RCE-1 (TCP) | `MessageBoxA("RCE Succeeded")` via corrupted vtable dispatch |
-| 6 | `network_rce_ace.js` | RCE-2 (UDP) | `MessageBoxA("RCE Succeeded")` via corrupted vtable dispatch |
-
-All proofs run inside the game's own address space via Frida. No network traffic is sent — each script allocates heap buffers matching the real structures, replicates the exact overflow geometry, and verifies every corrupted byte.
-
-See [`poc/README.md`](poc/README.md) for detailed reproduction steps and expected output.
-
-## What Each PoC Proves (And What It Doesn't)
-
-**What is proven:**
-- The vulnerable recv path has no bounds checking (static analysis — Ghidra decompilation)
-- The attacker-controlled length field produces a recv size of 32,769 bytes (length parsing replicated in-process)
-- The overflow writes past the buffer into adjacent heap objects (memory verification)
-- All 14 function pointers in the adjacent object are overwritten (corruption verification)
-- Dispatching through a corrupted pointer executes attacker-chosen code (MessageBoxA fires)
-- No ASLR — all addresses are fixed and known (`0x400000` base)
-- No DEP — heap memory is executable
-
-**What is not proven:**
-- End-to-end network exploitation (sending a crafted packet over a real socket)
-- This would require a fake game server (RCE-1) or a second game instance on LAN (RCE-2)
-- That is a weaponized exploit, which is beyond the scope of security research
-
-Each link in the chain is independently verified. The missing bounds check is in the decompiled code. The overflow math is demonstrated in the game's own heap. The code execution is live. The chain is mathematically certain.
-
-## Full Technical Analysis
-
-See [NETWORK-VULNS.md](NETWORK-VULNS.md) for the complete vulnerability analysis including:
-- All four network vulnerabilities (NET-1 through NET-4)
-- Decompiled code for each vulnerable function
-- Buffer geometry and overflow size calculations
-- Network architecture of the game's multiplayer stack
-- Comparison with the save file ACE (CVSS 7.8 vs 9.8)
-
-## Repository Contents
+The game uses a custom pool allocator (not the Windows heap). Free blocks form a circular doubly-linked list sorted by address:
 
 ```
-├── README.md                    This file
-├── NETWORK-VULNS.md             Full network vulnerability analysis (4 vulns)
-├── poc/
-│   ├── README.md                Detailed reproduction steps for all 6 proofs
-│   ├── network_rce_proof.js     PoC 1-2: Heap overflow proof (both vectors)
-│   ├── network_eip_control.js   PoC 3-4: EIP control proof (both vectors)
-│   └── network_rce_ace.js       PoC 5-6: Arbitrary code execution proof (both vectors)
-└── LICENSE
+Free node:    [next:4] [prev:4] [size:4] [magic:4]    magic = 0x44443333
+Block header: 20 bytes, magic byte 0x22 at offset 9
+Overhead:     20 (header) + name_area_length
 ```
 
-## Requirements
+The free function performs sorted insert, then forward and backward coalesce with adjacent blocks. The coalesce unlink writes to corrupted pointers — this is the arbitrary write primitive.
 
-- Need for Speed Underground 2 (PC, Windows)
-- [Frida](https://frida.re/) (`pip install frida-tools`)
-- The game running (main menu is sufficient for PoC 1-4; no multiplayer session needed)
+### Shellcode Bridge
 
-## Quick Start
+The fake prev node's first 4 bytes get clobbered during the sorted insert step. The bridge handles this:
+
+```asm
+[0-3]   Clobbered → 50 BE 7F 00 → PUSH EAX; MOV ESI, imm32
+[4-5]   NOP NOP (consumed by MOV ESI's immediate)
+[6-7]   JMP SHORT +4 (skip the size field)
+[8-11]  Coalesce trigger size (modified during merge, skipped)
+[12+]   Position-independent shellcode (105 bytes)
+```
+
+### PoC Payload
+
+The proof-of-concept shellcode demonstrates code execution with:
+1. Restores the function pointer (game keeps running)
+2. `MessageBoxA` — "PWNED" / "NFS Underground 2 RCE!"
+3. `ShellExecuteA` — opens calc.exe
+
+## Running the PoC
+
+### Prerequisites
+
+Add to your hosts file (`C:\Windows\System32\drivers\etc\hosts`):
+```
+127.0.0.1 pcnfs05.ea.com
+```
+
+### Steps
+
+1. Double-click **nfsu2_rce_v3.exe** — it opens and waits for a connection
+2. Launch NFS Underground 2
+3. Navigate to **Online → Use Existing**
+4. The exploit runs automatically when the game connects
+
+No admin privileges required. No process injection. No external tools.
+
+## Files
 
 ```
-frida -p <PID> -l poc/network_rce_proof.js       # Overflow proof
-frida -p <PID> -l poc/network_eip_control.js      # EIP control
-frida -p <PID> -l poc/network_rce_ace.js          # Code execution (shows MessageBox)
+poc/
+  nfsu2_rce_v3.cs    — Exploit source code (fully commented C#)
+  nfsu2_rce_v3.exe   — Compiled PoC (x86, .NET Framework 4.0)
+```
+
+## Build
+
+```
+C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe /platform:x86 /out:nfsu2_rce_v3.exe nfsu2_rce_v3.cs
 ```
 
 ## Tools Used
 
-- [Ghidra](https://ghidra-sre.org/) 12.1.4 via [REA](https://re-anytime.com/) — static analysis, decompilation, cross-reference analysis
-- [Frida](https://frida.re/) — dynamic instrumentation, in-process overflow verification, code execution proof
+- [Ghidra](https://ghidra-sre.org/) 12.1.4 via [REA](https://re-anytime.com/) — static analysis and decompilation
+- Custom C# exploit (no dependencies beyond .NET Framework 4.0)
 
 ## Disclaimer
 
-This research is published for **educational and defensive purposes only**. The vulnerabilities exist in a 22-year-old game with no active security support from the vendor. No weaponized exploit is included — no shellcode, no packet sender, no network attack tool. The PoCs demonstrate the exploit chain in isolated heap allocations and nothing more.
-
-Do not use this research to attack other players. Don't be that person.
+Security research against an abandoned game whose online servers were shut down in 2007. The vulnerability exists in the original unpatched binary. Published for educational purposes to demonstrate real-world heap exploitation techniques. No active online services are affected.
 
 ## License
 
-Research scripts and documentation are released under the [MIT License](LICENSE). The game binary and its assets remain the property of Electronic Arts.
+MIT — see [LICENSE](LICENSE)
