@@ -2,6 +2,8 @@
 
 Two remote code execution vulnerabilities discovered in Need for Speed: Underground 2 (SPEED2.EXE). This repository contains a working proof-of-concept for one of them — a single TCP packet that achieves arbitrary code execution through the game's own code. No injection, no external tools, no user interaction beyond connecting to a server.
 
+### [Video Demonstration](https://youtu.be/U_fJL2CEdgE)
+
 ## Vulnerabilities
 
 | # | Vector | Description | Status |
